@@ -1,0 +1,132 @@
+rules_version = '2';
+
+// Message Board (CSC 4360 Homework 02) security rules.
+//
+// Default deny: a path is readable or writable only where a rule below
+// explicitly allows it. Client UI checks are conveniences; these rules are
+// the authorization boundary.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------
+    // Private user profiles: users/{uid}
+    // Written by UserRecordService.saveProfile (set with merge: true).
+    // ---------------------------------------------------------------
+    match /users/{userId} {
+
+      function signedInAs(uid) {
+        return request.auth != null && request.auth.uid == uid;
+      }
+
+      function isName(value) {
+        return value is string && value.size() > 0;
+      }
+
+      // The five required fields, correctly typed.
+      function hasValidProfile() {
+        let incoming = request.resource.data;
+        return incoming.keys().hasOnly(
+                 ['uid', 'firstName', 'lastName', 'role',
+                  'registrationDateTime'])
+               && incoming.uid == userId
+               && isName(incoming.firstName)
+               && isName(incoming.lastName)
+               && incoming.role is string
+               && incoming.registrationDateTime is timestamp;
+      }
+
+      // A role may only be introduced as 'member', and may never change.
+      // This blocks client-side role escalation.
+      function rolePreserved() {
+        return ('role' in resource.data && resource.data.role is string
+                  && resource.data.role.size() > 0)
+               ? request.resource.data.role == resource.data.role
+               : request.resource.data.role == 'member';
+      }
+
+      // An original registration time can never be rewritten. When none is
+      // stored yet, the new one must come from FieldValue.serverTimestamp().
+      function registrationPreserved() {
+        return ('registrationDateTime' in resource.data
+                  && resource.data.registrationDateTime is timestamp)
+               ? request.resource.data.registrationDateTime
+                   == resource.data.registrationDateTime
+               : request.resource.data.registrationDateTime == request.time;
+      }
+
+      // Only the owner reads their own record. No list: nobody may enumerate
+      // the users collection.
+      allow get: if signedInAs(userId);
+
+      // First write of a profile, from RegisterScreen.
+      allow create: if signedInAs(userId)
+                    && hasValidProfile()
+                    && request.resource.data.role == 'member'
+                    && request.resource.data.registrationDateTime
+                         == request.time;
+
+      // Completing or repairing an incomplete profile.
+      allow update: if signedInAs(userId)
+                    && hasValidProfile()
+                    && rolePreserved()
+                    && registrationPreserved();
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // Board messages: messages/{msgId}
+    // Written by BoardService.postMessage / editMessage / deleteMessage.
+    // ---------------------------------------------------------------
+    match /messages/{msgId} {
+
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isAuthor() {
+        return isSignedIn() && request.auth.uid == resource.data.authorUid;
+      }
+
+      function hasValidText() {
+        return request.resource.data.text is string
+               && request.resource.data.text.size() > 0;
+      }
+
+      // Any signed-in user may read the board; signed-out users may not.
+      allow read: if isSignedIn();
+
+      // The author UID is taken from the token, so it cannot be forged.
+      allow create: if isSignedIn()
+                    && request.resource.data.keys().hasOnly(
+                         ['text', 'authorUid', 'authorName', 'createdAt',
+                          'editedAt'])
+                    && request.resource.data.authorUid == request.auth.uid
+                    && hasValidText()
+                    && request.resource.data.authorName is string
+                    && request.resource.data.createdAt == request.time
+                    && request.resource.data.editedAt == null;
+
+      // Only the original author may edit, and only text and editedAt may
+      // change. authorUid, authorName and createdAt are immutable here.
+      allow update: if isAuthor()
+                    && request.resource.data.diff(resource.data)
+                         .affectedKeys().hasOnly(['text', 'editedAt'])
+                    && hasValidText()
+                    && request.resource.data.editedAt == request.time
+                    && request.resource.data.authorUid
+                         == resource.data.authorUid
+                    && request.resource.data.authorName
+                         == resource.data.authorName
+                    && request.resource.data.createdAt
+                         == resource.data.createdAt;
+
+      allow delete: if isAuthor();
+    }
+
+    // Everything else is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
